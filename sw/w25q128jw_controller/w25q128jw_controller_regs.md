@@ -11,6 +11,7 @@
 | w25q128jw_controller.[`INTR_STATUS`](#intr_status)                     | 0x18     |        4 | Interrupt status register                                                  |
 | w25q128jw_controller.[`INTR_ENABLE`](#intr_enable)                     | 0x1c     |        4 | Interrupt enable register                                                  |
 | w25q128jw_controller.[`DMA_SLOT_WAIT_COUNTER`](#dma_slot_wait_counter) | 0x20     |        4 | A DMA counter used to wait before submitting the next req when using slots |
+| w25q128jw_controller.[`ADDRESS_MEMIO_WRITE`](#address_memio_write)     | 0x24     |        4 | Address for memio write operation with DMA                                 |
 
 ## CONTROL
 Control register for flash controller
@@ -162,4 +163,20 @@ A DMA counter used to wait before submitting the next req when using slots
 |:------:|:------:|:-------:|:----------------------|:---------------------------------------------------------------------------|
 |  31:8  |        |         |                       | Reserved                                                                   |
 |  7:0   |   rw   |   0x0   | DMA_SLOT_WAIT_COUNTER | A DMA counter used to wait before submitting the next req when using slots |
+
+## ADDRESS_MEMIO_WRITE
+Address for memio write operation with DMA
+- Offset: `0x24`
+- Reset default: `0x0`
+- Reset mask: `0xffffffff`
+
+### Fields
+
+```wavejson
+{"reg": [{"name": "ADDRESS_MEMIO_WRITE", "bits": 32, "attr": ["ro"], "rotate": 0}], "config": {"lanes": 1, "fontsize": 10, "vspace": 80}}
+```
+
+|  Bits  |  Type  |  Reset  | Name                | Description                                |
+|:------:|:------:|:-------:|:--------------------|:-------------------------------------------|
+|  31:0  |   ro   |   0x0   | ADDRESS_MEMIO_WRITE | Address for memio write operation with DMA |
 

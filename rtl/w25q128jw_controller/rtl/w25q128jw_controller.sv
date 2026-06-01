@@ -16,10 +16,21 @@
  *                      Alain Girard <alain.girard@epfl.ch>
  *                                   <alaingirardvd@gmail.com>
  */
+
+
+
+`ifdef VERILATOR
+localparam QUAD_AVAILABLE = 0;
+`else
+localparam QUAD_AVAILABLE = 1;
+`endif
+
+
 module w25q128jw_controller
   import core_v_mini_mcu_pkg::*;
   import dma_reg_pkg::*;
   import spi_host_reg_pkg::*;
+  import obi_pkg::*;
 #(
     parameter type reg_req_t = reg_pkg::reg_req_t,
     parameter type reg_rsp_t = reg_pkg::reg_rsp_t
@@ -30,6 +41,10 @@ module w25q128jw_controller
     // Register interface from system bus
     input  reg_req_t reg_req_i,
     output reg_rsp_t reg_rsp_o,
+
+    // Memory mapped SPI
+    input  obi_req_t  spimemio_req_i,
+    output obi_resp_t spimemio_resp_o,
 
     // Interrupt signal
     output logic w25q128jw_controller_intr_o,
@@ -140,6 +155,12 @@ module w25q128jw_controller
     READ_SPI_QUAD_WAIT_READY_DUMMY,  // Wait for SPI Host
     READ_SPI_SEND_CMD_5_QUAD,        // Send RX command (quad mode)
 
+    READ_MEMIO_SET_RXWM_R,  // Wait for RX watermark for memio read
+    READ_MEMIO_SET_RXWM_W,
+    READ_MEMIO_SPI_WAIT_WM,
+    READ_MEMIO_READ_RXDATA,  // Read RXDATA for memio read
+    READ_MEMIO_RESTORE_RXWM_W,
+
     READ_TRANS  // Wait for DMA transfer complete
   } read_state_e;
 
@@ -244,6 +265,13 @@ module w25q128jw_controller
     RETURN_WRITE    // Return to WRITE FSM (RAM sector buffer -> flash transfer)
   } dma_init_return_e;
 
+  // -------- MEMIO FAST-PATH STATES --------
+  typedef enum logic [2:0] {
+    MEMIO_IDLE,
+    MEMIO_READ,
+    MEMIO_WRITE
+  } memio_state_e;
+
   // FSM signals
   top_state_e top_state_q, top_state_d;
   read_state_e read_state_q, read_state_d;
@@ -262,6 +290,13 @@ module w25q128jw_controller
 
   logic [31:0] dma_size;
   logic [31:0] flash_address;
+
+  // memio fast-path
+  logic [31:0] memio_addr_q, memio_addr_d;
+  logic [31:0] memio_data_q, memio_data_d;
+  logic [ 3:0] memio_be;
+  logic [31:0] memio_write_offset;
+  memio_state_e memio_state_q, memio_state_d;
 
   // FSM sequential logic
   always_ff @(posedge clk_i or negedge rst_ni) begin
@@ -282,6 +317,9 @@ module w25q128jw_controller
       sector_iter_offset_q <= 32'h0;
       md_offset_q <= 32'h0;
       spi_control_q <= 32'h0;
+      memio_addr_q <= 32'h0;
+      memio_data_q <= 32'h0;
+      memio_state_q <= MEMIO_IDLE;
     end else begin
       dma_init_state_q <= dma_init_state_d;
       dma_init_return_q <= dma_init_return_d;
@@ -296,12 +334,18 @@ module w25q128jw_controller
       sector_iter_offset_q <= sector_iter_offset_d;
       md_offset_q <= md_offset_d;
       spi_control_q <= spi_control_d;
+      memio_addr_q <= memio_addr_d;
+      memio_data_q <= memio_data_d;
+      memio_state_q <= memio_state_d;
     end
   end
 
   logic [spi_host_reg_pkg::BlockAw-1:0] spi_host_reg_req_offset;
 
   assign spi_host_reg_req_o.addr = SPI_FLASH_START_ADDRESS + {{(32 - spi_host_reg_pkg::BlockAw){1'b0}}, spi_host_reg_req_offset};
+
+  logic quad_select;
+  assign quad_select = reg2hw.control.quad.q & QUAD_AVAILABLE;
 
   // FSM combinational logic
   always_comb begin
@@ -318,6 +362,9 @@ module w25q128jw_controller
     sector_iter_offset_d = sector_iter_offset_q;
     md_offset_d = md_offset_q;
     spi_control_d = spi_control_q;
+    memio_addr_d = memio_addr_q;
+    memio_data_d = memio_data_q;
+    memio_state_d = memio_state_q;
 
     sector_offset = 32'h0;
 
@@ -341,6 +388,10 @@ module w25q128jw_controller
     spi_host_reg_req_o.wdata = '0;
     spi_host_reg_req_offset  = '0;
 
+    spimemio_resp_o.rvalid = 1'b0;
+    spimemio_resp_o.rdata = '0;
+    spimemio_resp_o.gnt = 1'b0;
+
     // ============================================================================
     // TOP FSM
     // ============================================================================
@@ -360,6 +411,63 @@ module w25q128jw_controller
       TOP_IDLE: begin
         if (reg2hw.control.start.q) begin
           top_state_d = TOP_READ;  // Always start with READ (for both read and write operations)
+        end else if (spimemio_req_i.req) begin
+          memio_addr_d = spimemio_req_i.addr;
+          memio_data_d = spimemio_req_i.wdata;
+
+          hw2reg.address_memio_write.de = 1'b1;
+          hw2reg.length.de = 1'b1;
+          case (spimemio_req_i.be)
+            4'h1: begin
+              // Byte 0
+              hw2reg.address_memio_write.d = {24'h0, spimemio_req_i.wdata[7:0]};
+              hw2reg.length.d = 32'd1;
+              memio_write_offset = 0;
+            end
+            4'h2: begin
+              // Byte 1
+              hw2reg.address_memio_write.d = {24'h0, spimemio_req_i.wdata[15:8]};
+              hw2reg.length.d = 32'd1;
+              memio_write_offset = 1;
+            end
+            4'h3: begin
+              // Bytes 0-1
+              hw2reg.address_memio_write.d = {16'h0, spimemio_req_i.wdata[15:0]};
+              hw2reg.length.d = 32'd2;
+              memio_write_offset = 0;
+            end
+            4'h4: begin
+              // Byte 2
+              hw2reg.address_memio_write.d = {24'h0, spimemio_req_i.wdata[23:16]};
+              hw2reg.length.d = 32'd1;
+              memio_write_offset = 2;
+            end
+            4'h8: begin
+              // Byte 3
+              hw2reg.address_memio_write.d = {24'h0, spimemio_req_i.wdata[31:24]};
+              hw2reg.length.d = 32'd1;
+              memio_write_offset = 3;
+            end
+            4'hC: begin
+              // Bytes 2-3
+              hw2reg.address_memio_write.d = {16'h0, spimemio_req_i.wdata[31:16]};
+              hw2reg.length.d = 32'd2;
+              memio_write_offset = 2;
+            end
+            default: begin
+              // All bytes (0-3)
+              hw2reg.address_memio_write.d = spimemio_req_i.wdata;
+              hw2reg.length.d = 32'd4;
+              memio_write_offset = 0;
+            end
+          endcase
+          // hw2reg.address_memio_write.d = spimemio_req_i.wdata;
+
+          memio_be = spimemio_req_i.be;
+          spimemio_resp_o.gnt = 1'b1;
+
+          memio_state_d = spimemio_req_i.we ? MEMIO_WRITE : MEMIO_READ;
+          top_state_d = TOP_READ;
         end
       end
 
@@ -375,9 +483,13 @@ module w25q128jw_controller
         case (read_state_q)
           // -------- IDLE: Trigger DMA initialization --------
           READ_IDLE: begin
-            top_state_d       = TOP_DMA_INIT;  // Go to DMA init FSM
-            dma_init_return_d = RETURN_READ;  // Return here after DMA init
-            read_state_d      = READ_SET_DMA;  // Next state after returning from DMA init
+            if (memio_state_q == MEMIO_READ) begin
+              read_state_d = READ_SPI_CHECK_TX_FIFO;
+            end else begin
+              top_state_d       = TOP_DMA_INIT;  // Go to DMA init FSM
+              dma_init_return_d = RETURN_READ;  // Return here after DMA init
+              read_state_d      = READ_SET_DMA;  // Next state after returning from DMA init
+            end
           end
 
           // ============== DMA CONFIGURATION ==============
@@ -434,7 +546,11 @@ module w25q128jw_controller
             // See hw/vendor/lowrisc_opentitan_spi_host/data/spi_host.hjson for status register bit mapping
             // See hw/vendor/lowrisc_opentitan_spi_host/rtl/spi_host_reg_pkg.sv for TXQD depth definition
             if (external_spi_host_hw2reg_status_i.txqd.d < SPI_FLASH_TX_FIFO_DEPTH[7:0]) begin
-              read_state_d = reg2hw.control.quad.q ? READ_SPI_SEND_CMD_1_QUAD : READ_SPI_FILL_TX_FIFO;
+              if ((memio_state_q != MEMIO_IDLE && QUAD_AVAILABLE) || quad_select) begin
+                read_state_d = READ_SPI_SEND_CMD_1_QUAD;
+              end else begin
+                read_state_d = READ_SPI_FILL_TX_FIFO;
+              end
             end
           end
 
@@ -445,17 +561,18 @@ module w25q128jw_controller
             spi_host_reg_req_offset  = SPI_HOST_TXDATA_OFFSET;
             spi_host_reg_req_o.write = 1'b1;
             spi_host_reg_req_o.valid = 1'b1;
-            if (reg2hw.control.rnw.q) begin
-              // READ: Use exact flash address from F_ADDRESS register
+            if (memio_state_q == MEMIO_READ) begin
+              flash_address = memio_addr_q & 32'h00ffffff;
+            end else if (memio_state_q == MEMIO_WRITE) begin
+              flash_address = memio_addr_q & 32'h00fff000;
+            end else if (reg2hw.control.rnw.q) begin
               flash_address = reg2hw.f_address.q & 32'h00ffffff;
-              spi_host_reg_req_o.wdata = (((bitfield_byteswap32(flash_address)) >> 8) << 8) |
-                  {19'h0, FC_RD};
             end else begin
               // WRITE: Use sector-aligned address + current sector iteration offset
               flash_address = (reg2hw.f_address.q & 32'h00fff000) + (sector_iter_offset_q);
-              spi_host_reg_req_o.wdata = (((bitfield_byteswap32(flash_address)) >> 8) << 8) |
-                  {19'h0, FC_RD};
             end
+            spi_host_reg_req_o.wdata = (((bitfield_byteswap32(flash_address)) >> 8) << 8) |
+                {19'h0, FC_RD};
             if (spi_host_reg_rsp_i.ready && ~spi_host_reg_rsp_i.error) begin
               read_state_d = READ_SPI_WAIT_READY_1;
             end
@@ -503,7 +620,9 @@ module w25q128jw_controller
             spi_host_reg_req_offset  = SPI_HOST_COMMAND_OFFSET;
             spi_host_reg_req_o.write = 1'b1;
             spi_host_reg_req_o.valid = 1'b1;
-            if (reg2hw.control.rnw.q) begin
+            if (memio_state_q == MEMIO_READ) begin
+              spi_host_reg_req_o.wdata = spi_cmd_pack(SPI_DIR_RX, SPI_SPEED_STD, 1'b0, 24'h3);
+            end else if (reg2hw.control.rnw.q) begin
               // READ: receive user-specified number of bytes
               spi_host_reg_req_o.wdata =
                   spi_cmd_pack(SPI_DIR_RX, SPI_SPEED_STD, 1'b0, reg2hw.length.q[23:0] - 1'h1);
@@ -512,8 +631,73 @@ module w25q128jw_controller
               spi_host_reg_req_o.wdata =
                   spi_cmd_pack(SPI_DIR_RX, SPI_SPEED_STD, 1'b0, {11'b0, SE_BSIZE - 1'h1});
             end
+
             if (spi_host_reg_rsp_i.ready && ~spi_host_reg_rsp_i.error) begin
-              read_state_d = READ_TRANS;
+              if (memio_state_q == MEMIO_READ) begin
+                // For memory-mapped single read: wait for RX watermark then read RXDATA directly
+                read_state_d = READ_MEMIO_SET_RXWM_R;
+              end else begin
+                read_state_d = READ_TRANS;
+              end
+            end
+          end
+
+          READ_MEMIO_SET_RXWM_R: begin
+            spi_host_reg_req_offset  = SPI_HOST_CONTROL_OFFSET;
+            spi_host_reg_req_o.write = 1'b0;
+            spi_host_reg_req_o.valid = 1'b1;
+            if (spi_host_reg_rsp_i.ready && ~spi_host_reg_rsp_i.error) begin
+              spi_control_d = spi_host_reg_rsp_i.rdata;
+              read_state_d  = READ_MEMIO_SET_RXWM_W;
+            end
+          end
+
+          // -------- Write back with RX watermark = 1 --------
+          READ_MEMIO_SET_RXWM_W: begin
+            spi_host_reg_req_offset = SPI_HOST_CONTROL_OFFSET;
+            spi_host_reg_req_o.write = 1'b1;
+            spi_host_reg_req_o.valid = 1'b1;
+            spi_host_reg_req_o.wdata = {
+              spi_control_q[31:8], 8'h01
+            };  // Keep upper CONTROL bits, set RXWM = 1
+            if (spi_host_reg_rsp_i.ready && ~spi_host_reg_rsp_i.error) begin
+              read_state_d = READ_MEMIO_SPI_WAIT_WM;
+            end
+          end
+
+          READ_MEMIO_SPI_WAIT_WM: begin
+            // STATUS[31] = READY bit. Proceed if ready.
+            if (external_spi_host_hw2reg_status_i.rxwm.d) begin
+              read_state_d = READ_MEMIO_READ_RXDATA;
+            end
+          end
+
+          // -------- MEMIO: read RXDATA and place into spimemio response --------
+          READ_MEMIO_READ_RXDATA: begin
+            spi_host_reg_req_offset  = SPI_HOST_RXDATA_OFFSET;
+            spi_host_reg_req_o.write = 1'b0;
+            spi_host_reg_req_o.valid = 1'b1;
+            if (spi_host_reg_rsp_i.ready && ~spi_host_reg_rsp_i.error) begin
+              // Stash the received word, then restore previous CONTROL (RXWM)
+              memio_data_d = spi_host_reg_rsp_i.rdata;
+              read_state_d = READ_MEMIO_RESTORE_RXWM_W;
+            end
+          end
+
+          // -------- MEMIO: restore original CONTROL register (RXWM) --------
+          READ_MEMIO_RESTORE_RXWM_W: begin
+            spi_host_reg_req_offset  = SPI_HOST_CONTROL_OFFSET;
+            spi_host_reg_req_o.write = 1'b1;
+            spi_host_reg_req_o.valid = 1'b1;
+            // Restore previous CONTROL value saved in spi_control_q
+            spi_host_reg_req_o.wdata = spi_control_q;
+            if (spi_host_reg_rsp_i.ready && ~spi_host_reg_rsp_i.error) begin
+              spimemio_resp_o.rdata = memio_data_q;
+              spimemio_resp_o.rvalid = 1'b1;
+              // Clear memio flag and finish transaction
+              memio_state_d = MEMIO_IDLE;
+              read_state_d = READ_IDLE;
+              top_state_d = TOP_IDLE;
             end
           end
 
@@ -555,7 +739,11 @@ module w25q128jw_controller
             spi_host_reg_req_o.write = 1'b1;
             spi_host_reg_req_o.valid = 1'b1;
 
-            if (reg2hw.control.rnw.q) begin
+            if (memio_state_q == MEMIO_READ) begin
+              flash_address = memio_addr_q & 32'h00ffffff;
+            end else if (memio_state_q == MEMIO_WRITE) begin
+              flash_address = memio_addr_q & 32'h00fff000;
+            end else if (reg2hw.control.rnw.q) begin
               // READ: Use exact flash address from F_ADDRESS register
               flash_address = reg2hw.f_address.q & 32'h00ffffff;
             end else begin
@@ -612,7 +800,10 @@ module w25q128jw_controller
             spi_host_reg_req_offset  = SPI_HOST_COMMAND_OFFSET;
             spi_host_reg_req_o.write = 1'b1;
             spi_host_reg_req_o.valid = 1'b1;
-            if (reg2hw.control.rnw.q) begin
+
+            if (memio_state_q == MEMIO_READ) begin
+              spi_host_reg_req_o.wdata = spi_cmd_pack(SPI_DIR_RX, SPI_SPEED_QUAD, 1'b0, 24'h3);
+            end else if (reg2hw.control.rnw.q) begin
               spi_host_reg_req_o.wdata =
                   spi_cmd_pack(SPI_DIR_RX, SPI_SPEED_QUAD, 1'b0, reg2hw.length.q[23:0] - 1'h1);
             end else begin
@@ -620,7 +811,11 @@ module w25q128jw_controller
               spi_host_reg_req_o.wdata =
                   spi_cmd_pack(SPI_DIR_RX, SPI_SPEED_QUAD, 1'b0, {11'b0, SE_BSIZE - 1'h1});
             end
-            if (spi_host_reg_rsp_i.ready && ~spi_host_reg_rsp_i.error) begin
+
+            if (memio_state_q == MEMIO_READ) begin
+              // For memory-mapped single read: wait for RX watermark then read RXDATA directly
+              read_state_d = READ_MEMIO_SET_RXWM_R;
+            end else begin
               read_state_d = READ_TRANS;
             end
           end
@@ -814,6 +1009,14 @@ module w25q128jw_controller
                       hw2reg.control.start.d = 1'b0;
                       hw2reg.intr_status.de   = 1'b1;     // Set interrupt status (rise IRQ through assignements (see end of module))
                       hw2reg.intr_status.d = reg2hw.intr_enable.q;
+
+                      if (memio_state_q == MEMIO_WRITE) begin
+                        memio_state_d = MEMIO_IDLE;  // Clear memio state 
+                        hw2reg.address_memio_write.de = 1'b1;
+                        hw2reg.address_memio_write.d = 32'h0;  // Clear memio address write register
+                        spimemio_resp_o.rvalid = 1'b1;
+                        spimemio_resp_o.rdata = memio_data_q;  // Return written data
+                      end
                     end else begin
                       top_state_d = TOP_READ;
                     end
@@ -919,12 +1122,16 @@ module w25q128jw_controller
           // -------- Write Sector Erase command + address to TX FIFO --------
 
           ERASE_SE_FILL_TX_FIFO: begin
-            spi_host_reg_req_offset = SPI_HOST_TXDATA_OFFSET;
+            spi_host_reg_req_offset  = SPI_HOST_TXDATA_OFFSET;
             spi_host_reg_req_o.write = 1'b1;
             spi_host_reg_req_o.valid = 1'b1;
             // Use sector-aligned address + current sector iteration offset + SECTOR ERASE command
             // Inspiration from sw/device/bsp/w25q
-            flash_address = (reg2hw.f_address.q & 32'h00fff000) + (sector_iter_offset_q);
+            if (memio_state_q == MEMIO_WRITE) begin
+              flash_address = memio_addr_q & 32'h00fff000;  // Only a single sector
+            end else begin
+              flash_address = (reg2hw.f_address.q & 32'h00fff000) + (sector_iter_offset_q);
+            end
             spi_host_reg_req_o.wdata = ((bitfield_byteswap32(flash_address) >> 8) << 8) |
                 {19'h0, FC_SE};
             if (spi_host_reg_rsp_i.ready && ~spi_host_reg_rsp_i.error) begin
@@ -983,7 +1190,11 @@ module w25q128jw_controller
 
         // -------- Compute sector offset --------
         if (sector_iter_offset_q == 0) begin
-          sector_offset = reg2hw.f_address.q & 32'h00000fff;  // Offset within sector for first iteration
+          if (memio_state_d == MEMIO_WRITE) begin
+            sector_offset = memio_addr_q & 32'h00000fff;
+          end else begin
+            sector_offset = reg2hw.f_address.q & 32'h00000fff;  // Offset within sector for first iteration
+          end
         end else begin
           sector_offset = 32'h0;  // Begin from start of sector for next iterations
         end
@@ -1003,24 +1214,86 @@ module w25q128jw_controller
             external_dma_hw2reg_o.src_ptr.de = 1'b1;
             // Source = MD_ADDRESS + offset for current sector iteration (for multi-sector writes)
             // F_ADDRESS not necessarily sector aligned and such case must be taken into consideration
-            external_dma_hw2reg_o.src_ptr.d = reg2hw.md_address.q + md_offset_q;
             //Set DMA destination pointer: RAM sector buffer
             external_dma_hw2reg_o.dst_ptr.de = 1'b1;
-            external_dma_hw2reg_o.dst_ptr.d = reg2hw.s_address.q + sector_offset;
+            if (memio_state_q == MEMIO_WRITE) begin
+              external_dma_hw2reg_o.src_ptr.d  = W25Q128JW_CONTROLLER_START_ADDRESS + {26'b0, W25Q128JW_CONTROLLER_ADDRESS_MEMIO_WRITE_OFFSET};
+              external_dma_hw2reg_o.dst_ptr.d = reg2hw.s_address.q + sector_offset + memio_write_offset;
+            end else begin
+              external_dma_hw2reg_o.src_ptr.d = reg2hw.md_address.q + md_offset_q;
+              external_dma_hw2reg_o.dst_ptr.d = reg2hw.s_address.q + sector_offset;
+            end
+
             // Destination = S_ADDRESS + offset within sector (for first iteration only, otherwise sector_offset = 0)
             // F_ADDRESS not necessarily sector aligned and such case must be taken into consideration
-            //Set source increment: +4 bytes per word
             external_dma_hw2reg_o.src_ptr_inc_d1.de = 1'b1;
-            external_dma_hw2reg_o.src_ptr_inc_d1.d  = 'h4;  // Increment by 4 bytes (32-bit word) in RAM
-            //Set destination increment: +4 bytes per word
             external_dma_hw2reg_o.dst_ptr_inc_d1.de = 1'b1;
-            external_dma_hw2reg_o.dst_ptr_inc_d1.d  = 'h4;  // Increment by 4 bytes (32-bit word) in RAM
-            //Set source data type: 32-bit word (See hw/ip/dma/data/dma.hjson for data type encoding)
-            external_dma_hw2reg_o.src_data_type.de = 1'b1;
-            external_dma_hw2reg_o.src_data_type.d = '0;  // 0 = 32-bit word
-            //Set destination data type: 32-bit word
-            external_dma_hw2reg_o.dst_data_type.de = 1'b1;
-            external_dma_hw2reg_o.dst_data_type.d = '0;  // 0 = 32-bit word
+            external_dma_hw2reg_o.src_data_type.de  = 1'b1;
+            external_dma_hw2reg_o.dst_data_type.de  = 1'b1;
+
+            if (memio_state_q == MEMIO_WRITE) begin
+              case (memio_be)
+                4'h1: begin
+                  // Byte 0 valid
+                  external_dma_hw2reg_o.src_ptr_inc_d1.d  = 'h0;  // No increment, single byte repeated for each word
+                  external_dma_hw2reg_o.dst_ptr_inc_d1.d = 'h0;
+                  external_dma_hw2reg_o.src_data_type.d = 'h3;  // 3 = 8-bit byte
+                  external_dma_hw2reg_o.dst_data_type.d = 'h3;  // 3 = 8-bit byte
+                end
+                4'h2: begin
+                  // Byte 1 valid
+                  external_dma_hw2reg_o.src_ptr_inc_d1.d  = 'h0;  // No increment, single byte repeated for each word
+                  external_dma_hw2reg_o.dst_ptr_inc_d1.d = 'h0;
+                  external_dma_hw2reg_o.src_data_type.d = 'h3;  // 3 = 8-bit byte
+                  external_dma_hw2reg_o.dst_data_type.d = 'h3;  // 3 = 8-bit byte
+                end
+                4'h3: begin
+                  // Byte 0 & 1 valid
+                  external_dma_hw2reg_o.src_ptr_inc_d1.d  = 'h0;  // No increment, single byte repeated for each word
+                  external_dma_hw2reg_o.dst_ptr_inc_d1.d = 'h0;
+                  external_dma_hw2reg_o.src_data_type.d = 'h1;  // 1 = 16-bit halfword
+                  external_dma_hw2reg_o.dst_data_type.d = 'h1;  // 1 = 16-bit halfword
+                end
+                4'h4: begin
+                  // Byte 2 valid
+                  external_dma_hw2reg_o.src_ptr_inc_d1.d  = 'h0;  // No increment, single byte repeated for each word
+                  external_dma_hw2reg_o.dst_ptr_inc_d1.d = 'h0;
+                  external_dma_hw2reg_o.src_data_type.d = 'h3;  // 3 = 8-bit byte
+                  external_dma_hw2reg_o.dst_data_type.d = 'h3;  // 3 = 8-bit byte
+                end
+                4'h8: begin
+                  // Byte 3 valid
+                  external_dma_hw2reg_o.src_ptr_inc_d1.d  = 'h0;  // No increment, single byte repeated for each word
+                  external_dma_hw2reg_o.dst_ptr_inc_d1.d = 'h0;
+                  external_dma_hw2reg_o.src_data_type.d = 'h3;  // 3 = 8-bit byte
+                  external_dma_hw2reg_o.dst_data_type.d = 'h3;  // 3 = 8-bit byte
+                end
+                4'hC: begin
+                  // Byte 2 & 3 valid
+                  external_dma_hw2reg_o.src_ptr_inc_d1.d  = 'h0;  // No increment, single byte repeated for each word
+                  external_dma_hw2reg_o.dst_ptr_inc_d1.d = 'h0;
+                  external_dma_hw2reg_o.src_data_type.d = 'h1;  // 1 = 16-bit halfword
+                  external_dma_hw2reg_o.dst_data_type.d = 'h1;  // 1 = 16-bit halfword
+                end
+                default: begin
+                  // All bytes valid
+                  external_dma_hw2reg_o.src_ptr_inc_d1.d = 'h0;
+                  external_dma_hw2reg_o.dst_ptr_inc_d1.d = 'h0;
+                  external_dma_hw2reg_o.src_data_type.d  = 'h0;  // 0 = 32-bit word
+                  external_dma_hw2reg_o.dst_data_type.d  = 'h0;  // 0 = 32-bit word
+                end
+              endcase
+
+            end else begin
+              //Set source increment: +4 bytes per word
+              external_dma_hw2reg_o.src_ptr_inc_d1.d  = 'h4;  // Increment by 4 bytes (32-bit word) in RAM
+              //Set destination increment: +4 bytes per word
+              external_dma_hw2reg_o.dst_ptr_inc_d1.d  = 'h4;  // Increment by 4 bytes (32-bit word) in RAM
+              //Set source data type: 32-bit word (See hw/ip/dma/data/dma.hjson for data type encoding)
+              external_dma_hw2reg_o.src_data_type.d = '0;  // 0 = 32-bit word
+              //Set destination data type: 32-bit word
+              external_dma_hw2reg_o.dst_data_type.d = '0;  // 0 = 32-bit word
+            end
             //Set DMA trigger slots (See sw/device/lib/drivers/dma/dma.h for trigger slot mapping)
             external_dma_hw2reg_o.slot.rx_trigger_slot.de = 1'b1;
             external_dma_hw2reg_o.slot.rx_trigger_slot.d = '0;
@@ -1158,13 +1431,18 @@ module w25q128jw_controller
           // -------- Write Page Program command + address to TX FIFO --------
           // Inspiration from sw/device/bsp/w25q
           WRITE_PP_FILL_TX_FIFO: begin
-            spi_host_reg_req_offset = SPI_HOST_TXDATA_OFFSET;
+            spi_host_reg_req_offset  = SPI_HOST_TXDATA_OFFSET;
             spi_host_reg_req_o.write = 1'b1;
             spi_host_reg_req_o.valid = 1'b1;
             // Compute page address: sector base + sector offset + page offset
-            flash_address = ((reg2hw.f_address.q & 32'h00fff000) + sector_iter_offset_q) |
+            if (memio_state_q == MEMIO_WRITE) begin
+              flash_address = ((memio_addr_q & 32'h00fff000) + sector_iter_offset_q) | 
                   ({28'h0, page_cnt_q} << 8);
-            if (reg2hw.control.quad.q) begin
+            end else begin
+              flash_address = ((reg2hw.f_address.q & 32'h00fff000) + sector_iter_offset_q) |
+                  ({28'h0, page_cnt_q} << 8);
+            end
+            if (quad_select || (memio_state_q == MEMIO_WRITE && QUAD_AVAILABLE)) begin
               spi_host_reg_req_o.wdata = (bitfield_byteswap32(flash_address) & 32'hffffff00) |
                   {19'h0, FC_PPQ};
             end else begin
@@ -1270,7 +1548,7 @@ module w25q128jw_controller
             spi_host_reg_req_o.valid = 1'b1;
             spi_host_reg_req_o.wdata = spi_cmd_pack(
               SPI_DIR_TX,
-              reg2hw.control.quad.q ? SPI_SPEED_QUAD : SPI_SPEED_STD,
+              (quad_select || (memio_state_q == MEMIO_WRITE && QUAD_AVAILABLE)) ? SPI_SPEED_QUAD : SPI_SPEED_STD,
               1'b0,
               {
                 11'b0, PAGE_BSIZE - 1'h1
